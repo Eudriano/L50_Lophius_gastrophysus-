@@ -1,0 +1,491 @@
+################################################################################ 
+# Manuscript: Reproductive biology of the monkfish Lophius gastrophysus in the 
+# southwestern Atlantic: histology, size at maturity, and fecundity
+# Costa et al. (2025)
+# Script used estimate the size at first mauturity (L50) of L. gastrophysus
+# Author: Eudriano Costa
+################################################################################
+
+# =============================================================================
+#                            DATA IMPORT & CLEANING
+# =============================================================================
+# Install packages if necessary:
+# install.packages("readxl")
+
+library(readxl)
+library(dplyr)
+library(stringr)
+
+# Set working directory if needed:
+# setwd("~/Documents/efc/R_Stat/2025_Lophius")
+
+# Import raw Excel data --------------------------------------------------------
+data <- read_excel("Orig_data.xlsx")
+
+# Quick diagnostics ------------------------------------------------------------
+head(data)   # preview dataset
+str(data)    # structure overview
+
+# Standardize ovarian phase categories ----------------------------------------
+# Any category starting with "Imat" → Immature; all others → Mature
+data <- data %>%
+  mutate(
+    Ovarian_phase = case_when(
+      str_detect(Ovarian_phase, regex("^Imat", ignore_case = TRUE)) ~ "Immature",
+      TRUE ~ "Mature"
+    )
+  )
+
+unique(data$Ovarian_phase)  # check conversion
+
+# =============================================================================
+#                         L50 DATA PREPARATION (King 1995)
+# =============================================================================
+library(dplyr)
+
+# Maturation is binary: Juvenile = 0, Adult = 1
+data$mature <- ifelse(data$Maturation == "Juvenile", 0, 1)
+
+# Convert Sex into readable categories
+data$sex <- ifelse(data$Sex == "F", "Females", "Males")
+
+# Split dataset by sex ---------------------------------------------------------
+data_males <- data[data$sex == "Males", ]
+data_females <- data[data$sex == "Females", ]
+
+# =============================================================================
+#                      KING (1995) LOGISTIC OGIVE FITTING
+# =============================================================================
+# Formula: p' = 1 / (1 + exp[-r(Ct - Ct50)])
+
+fit_king_model <- function(data, n_boot = 1000) {
+  
+  # Fit logistic regression
+  model <- glm(mature ~ Ct, family = binomial(link = "logit"), data = data)
+  
+  A <- coef(model)[1]   # intercept
+  B <- coef(model)[2]   # slope
+  
+  r <- B
+  Ct50 <- -A / B        # size-at-50%-maturity
+  
+  # Prediction grid for smooth ogive curve
+  seq_length <- seq(min(data$Ct), max(data$Ct), length = 200)
+  king_predictor <- -r * (seq_length - Ct50)
+  pred_probs <- 1 / (1 + exp(king_predictor))
+  
+  # ---------------------------- Bootstrap ------------------------------------
+  Ct50_boot <- numeric(n_boot)
+  r_boot <- numeric(n_boot)
+  pred_matrix <- matrix(NA, nrow = length(seq_length), ncol = n_boot)
+  
+  for(i in 1:n_boot) {
+    boot_indices <- sample(1:nrow(data), nrow(data), replace = TRUE)
+    boot_data <- data[boot_indices, ]
+    
+    tryCatch({
+      boot_model <- glm(mature ~ Ct, family = binomial(link = "logit"), data = boot_data)
+      boot_A <- coef(boot_model)[1]
+      boot_B <- coef(boot_model)[2]
+      
+      Ct50_boot[i] <- -boot_A / boot_B
+      r_boot[i] <- boot_B
+      
+      boot_king_pred <- -boot_B * (seq_length - Ct50_boot[i])
+      pred_matrix[, i] <- 1 / (1 + exp(boot_king_pred))
+      
+    }, error = function(e) {
+      Ct50_boot[i] <- NA
+      r_boot[i] <- NA
+      pred_matrix[, i] <- NA
+    })
+  }
+  
+  # Remove failed bootstrap fits
+  valid_indices <- !is.na(Ct50_boot) & !is.na(r_boot)
+  Ct50_boot <- Ct50_boot[valid_indices]
+  r_boot <- r_boot[valid_indices]
+  pred_matrix <- pred_matrix[, valid_indices]
+  
+  # Confidence intervals -------------------------------------------------------
+  Ct50_CI <- quantile(Ct50_boot, c(0.025, 0.975))
+  r_CI <- quantile(r_boot, c(0.025, 0.975))
+  pred_CI <- apply(pred_matrix, 1, quantile, c(0.025, 0.975), na.rm = TRUE)
+  
+  return(list(
+    model = model,
+    r = r,
+    r_CI = r_CI,
+    Ct50 = Ct50,
+    Ct50_CI = Ct50_CI,
+    seq_length = seq_length,
+    pred_probs = pred_probs,
+    pred_CI_lower = pred_CI[1, ],
+    pred_CI_upper = pred_CI[2, ],
+    data = data,
+    n = nrow(data)
+  ))
+}
+
+# Fit models for each sex
+king_males <- fit_king_model(data_males)
+king_females <- fit_king_model(data_females)
+
+# =============================================================================
+#                   CLASS-GROUPING FOR OBSERVED PROPORTIONS
+# =============================================================================
+
+create_length_classes <- function(lengths, class_width = 5) {
+  min_len <- floor(min(lengths) / class_width) * class_width
+  max_len <- ceiling(max(lengths) / class_width) * class_width
+  breaks <- seq(min_len, max_len, by = class_width)
+  class_midpoints <- (breaks[-1] + breaks[-length(breaks)]) / 2
+  return(list(breaks = breaks, midpoints = class_midpoints))
+}
+
+calculate_observed_proportions <- function(data, class_breaks) {
+  data$length_class <- cut(data$Ct, breaks = class_breaks, include.lowest = TRUE)
+  
+  prop_data <- data %>%
+    group_by(length_class) %>%
+    summarise(
+      n_total = n(),
+      n_mature = sum(mature),
+      proportion = n_mature / n_total,
+      mean_length = mean(Ct)
+    ) %>%
+    mutate(
+      lower_ci = proportion - 1.96 * sqrt((proportion * (1 - proportion)) / n_total),
+      upper_ci = proportion + 1.96 * sqrt((proportion * (1 - proportion)) / n_total)
+    )
+  
+  return(prop_data)
+}
+
+# Generate class structure
+classes_males   <- create_length_classes(data_males$Ct)
+classes_females <- create_length_classes(data_females$Ct)
+
+obs_males   <- calculate_observed_proportions(data_males, classes_males$breaks)
+obs_females <- calculate_observed_proportions(data_females, classes_females$breaks)
+
+# =============================================================================
+#                           PLOTTING FUNCTION
+# =============================================================================
+# Produces 4-panel plot:
+# 1. Male ogive
+# 2. Female ogive
+# 3. Male length distribution
+# 4. Female length distribution
+
+create_plots <- function() {
+  
+  # Colors for consistent visual theme
+  color_males <- "#2E8B57"
+  color_females <- "#4169E1"
+  color_immature <- "gray60"
+  color_mature <- "gray20"
+  color_ci_band <- "gray85"
+  color_grid <- "gray92"
+  
+  # Helper: shaded bootstrap CI
+  add_confidence_band <- function(x, lower, upper, color) {
+    polygon(c(x, rev(x)), c(lower, rev(upper)),
+            col = color_ci_band, border = NA)
+  }
+  
+  par(mfrow = c(2, 2), mar = c(4.5, 4.5, 3.5, 2), oma = c(0, 0, 2, 0))
+  
+  # ---------------------------------------------------
+  # PANEL 1: MALE MATURATION OGIVE
+  # ---------------------------------------------------
+  plot(0, 0, type = "n", 
+       xlim = range(data_males$Ct), ylim = c(0, 1.02),
+       xlab = "Total length (cm)", 
+       ylab = "Proportion mature'",
+       main = "MALES: Maturation Ogive",
+       panel.first = {
+         abline(h = seq(0, 1, by = 0.2), col = color_grid)
+         abline(v = pretty(range(data_males$Ct)), col = color_grid)
+       })
+  
+  add_confidence_band(king_males$seq_length,
+                      king_males$pred_CI_lower,
+                      king_males$pred_CI_upper)
+  
+  lines(king_males$seq_length, king_males$pred_probs, 
+        col = color_males, lwd = 2)
+  
+  abline(v = king_males$Ct50, col = color_males, lwd = 2)
+  abline(v = king_males$Ct50_CI, lty = 2, col = color_males, lwd = 2)
+  abline(h = 0.5, lty = 3, col = "gray50")
+  
+  rect(king_males$Ct50_CI[1], 0, 
+       king_males$Ct50_CI[2], 0.5,
+       col = adjustcolor(color_males, alpha.f = 0.15), border = NA)
+  
+  points(obs_males$mean_length, obs_males$proportion,
+         pch = 21, bg = "white", col = color_males, cex = 1.5)
+  
+  segments(obs_males$mean_length, obs_males$lower_ci,
+           obs_males$mean_length, obs_males$upper_ci,
+           col = color_males, lwd = 1.5)
+  
+  legend("bottomright", 
+         legend = c(
+           paste0("Ct₅₀ = ", round(king_males$Ct50, 1), " cm"),
+           paste0("95% CI: [", round(king_males$Ct50_CI[1], 1), ", ",
+                  round(king_males$Ct50_CI[2], 1), "]"),
+           paste0("r = ", round(king_males$r, 3)),
+           paste0("n = ", king_males$n),
+           expression(paste("p' = 1 / (1 + exp[-r(Ct - Ct"["50"],")])"))
+         ),
+         bty = "n", cex = 0.8, text.col = color_males)
+  
+  # ---------------------------------------------------
+  # PANEL 2: FEMALE MATURATION OGIVE
+  # ---------------------------------------------------
+  plot(0, 0, type = "n", 
+       xlim = range(data_females$Ct), ylim = c(0, 1.02),
+       xlab = "Total length (cm)", 
+       ylab = "Proportion mature'",
+       main = "FEMALES: Maturation Ogive",
+       panel.first = {
+         abline(h = seq(0, 1, by = 0.2), col = color_grid)
+         abline(v = pretty(range(data_females$Ct)), col = color_grid)
+       })
+  
+  add_confidence_band(king_females$seq_length,
+                      king_females$pred_CI_lower,
+                      king_females$pred_CI_upper)
+  
+  lines(king_females$seq_length, king_females$pred_probs, 
+        col = color_females, lwd = 2)
+  
+  abline(v = king_females$Ct50, col = color_females, lwd = 2)
+  abline(v = king_females$Ct50_CI, lty = 2, col = color_females, lwd = 2)
+  abline(h = 0.5, lty = 3, col = "gray50")
+  
+  rect(king_females$Ct50_CI[1], 0, 
+       king_females$Ct50_CI[2], 0.5,
+       col = adjustcolor(color_females, alpha.f = 0.15), border = NA)
+  
+  points(obs_females$mean_length, obs_females$proportion,
+         pch = 21, bg = "white", col = color_females, cex = 1.5)
+  
+  segments(obs_females$mean_length, obs_females$lower_ci,
+           obs_females$mean_length, obs_females$upper_ci,
+           col = color_females, lwd = 1.5)
+  
+  legend("bottomright", 
+         legend = c(
+           paste0("Ct₅₀ = ", round(king_females$Ct50, 1), " cm"),
+           paste0("95% CI: [", round(king_females$Ct50_CI[1], 1), ", ",
+                  round(king_females$Ct50_CI[2], 1), "]"),
+           paste0("r = ", round(king_females$r, 3)),
+           paste0("n = ", king_females$n),
+           expression(paste("p' = 1 / (1 + exp[-r(Ct - Ct"["50"],")])"))
+         ),
+         bty = "n", cex = 0.8, text.col = color_females)
+  
+  # ---------------------------------------------------
+  # PANEL 3: MALES - LENGTH DISTRIBUTION
+  # ---------------------------------------------------
+  male_immature <- data_males[data_males$mature == 0, ]
+  male_mature <- data_males[data_males$mature == 1, ]
+  
+  hist_males_immature <- hist(male_immature$Ct, plot = FALSE, breaks = classes_males$breaks)
+  hist_males_mature <- hist(male_mature$Ct, plot = FALSE, breaks = classes_males$breaks)
+  
+  ylim_max <- max(hist_males_immature$counts, hist_males_mature$counts) * 1.1
+  
+  plot(0, 0, type = "n", 
+       xlim = range(data_males$Ct), ylim = c(0, ylim_max),
+       xlab = "Total length, Ct (cm)", 
+       ylab = "Frequency",
+       main = "MALES: Length Distribution",
+       panel.first = {
+         abline(v = pretty(range(data_males$Ct)), col = color_grid)
+       })
+  
+  bar_width <- diff(hist_males_immature$breaks)[1] * 0.8
+  bar_positions <- hist_males_immature$mids
+  
+  # stacked immature + mature
+  rect(bar_positions - bar_width/2, 0,
+       bar_positions + bar_width/2, hist_males_immature$counts,
+       col = adjustcolor(color_immature, alpha.f = 0.8), border = color_immature)
+  
+  rect(bar_positions - bar_width/2, hist_males_immature$counts,
+       bar_positions + bar_width/2, hist_males_immature$counts + hist_males_mature$counts,
+       col = adjustcolor(color_mature, alpha.f = 0.8), border = color_mature)
+  
+  abline(v = king_males$Ct50, col = color_males, lwd = 2)
+  abline(v = king_males$Ct50_CI, lty = 2, col = color_males, lwd = 2)
+  
+  rect(king_males$Ct50_CI[1], 0, 
+       king_males$Ct50_CI[2], ylim_max * 0.95,
+       col = adjustcolor(color_males, alpha.f = 0.15), border = NA)
+  
+  legend("topright", 
+         legend = c("Immature", "Mature", "Ct₅₀", "95% CI"),
+         fill = c(adjustcolor(color_immature, alpha.f = 0.8), 
+                  adjustcolor(color_mature, alpha.f = 0.8), 
+                  NA, adjustcolor(color_males, alpha.f = 0.15)),
+         border = c(color_immature, color_mature, NA, NA),
+         lty = c(NA, NA, 1, NA),
+         col = c(NA, NA, color_males, NA),
+         lwd = c(NA, NA, 3, NA),
+         bty = "n")
+  
+  # ---------------------------------------------------
+  # PANEL 4: FEMALES - LENGTH DISTRIBUTION
+  # ---------------------------------------------------
+  female_immature <- data_females[data_females$mature == 0, ]
+  female_mature <- data_females[data_females$mature == 1, ]
+  
+  hist_females_immature <- hist(female_immature$Ct, plot = FALSE, breaks = classes_females$breaks)
+  hist_females_mature <- hist(female_mature$Ct, plot = FALSE, breaks = classes_females$breaks)
+  
+  ylim_max <- max(hist_females_immature$counts, hist_females_mature$counts) * 1.1
+  
+  plot(0, 0, type = "n", 
+       xlim = range(data_females$Ct), ylim = c(0, ylim_max),
+       xlab = "Total length, Ct (cm)", 
+       ylab = "Frequency",
+       main = "FEMALES: Length Distribution",
+       panel.first = {
+         abline(v = pretty(range(data_females$Ct)), col = color_grid)
+       })
+  
+  bar_width <- diff(hist_females_immature$breaks)[1] * 0.8
+  bar_positions <- hist_females_immature$mids
+  
+  rect(bar_positions - bar_width/2, 0,
+       bar_positions + bar_width/2, hist_females_immature$counts,
+       col = adjustcolor(color_immature, alpha.f = 0.8), border = color_immature)
+  
+  rect(bar_positions - bar_width/2, hist_females_immature$counts,
+       bar_positions + bar_width/2, hist_females_immature$counts + hist_females_mature$counts,
+       col = adjustcolor(color_mature, alpha.f = 0.8), border = color_mature)
+  
+  abline(v = king_females$Ct50, col = color_females, lwd = 2)
+  abline(v = king_females$Ct50_CI, lty = 2, col = color_females, lwd = 2)
+  
+  rect(king_females$Ct50_CI[1], 0, 
+       king_females$Ct50_CI[2], ylim_max * 0.95,
+       col = adjustcolor(color_females, alpha.f = 0.15), border = NA)
+  
+  legend("topright", 
+         legend = c("Immature", "Mature", "Ct₅₀", "95% CI"),
+         fill = c(adjustcolor(color_immature, alpha.f = 0.8), 
+                  adjustcolor(color_mature, alpha.f = 0.8), 
+                  NA, adjustcolor(color_females, alpha.f = 0.15)),
+         border = c(color_immature, color_mature, NA, NA),
+         lty = c(NA, NA, 1, NA),
+         col = c(NA, NA, color_females, NA),
+         lwd = c(NA, NA, 3, NA),
+         bty = "n")
+  
+  # Add global title
+  mtext("Sexual Maturation Analysis: King (1995) Logistic Model", 
+        side = 3, outer = TRUE, cex = 1.5, font = 2)
+}
+
+# =============================================================================
+#                           SAVING PLOTS
+# =============================================================================
+create_maturation_plots <- function(save_format = "both", width_cm = 20, height_cm = 16, dpi = 300) {
+  
+  # TIFF (high resolution)
+  if(save_format %in% c("tiff", "both")) {
+    tiff_filename <- "Maturation_Analysis_King1995.tiff"
+    tiff(tiff_filename, width = width_cm, height = height_cm,
+         units = "cm", res = dpi, compression = "lzw")
+    cat("Saving TIFF file:", tiff_filename, "\n")
+    create_plots()
+    dev.off()
+  }
+  
+  # PDF (vector)
+  if(save_format %in% c("pdf", "both")) {
+    pdf_filename <- "Maturation_Analysis_King1995.pdf"
+    pdf(pdf_filename, width = width_cm/2.54, height = height_cm/2.54)
+    cat("Saving PDF file:", pdf_filename, "\n")
+    create_plots()
+    dev.off()
+  }
+  
+  # Display only
+  if(save_format == "none") {
+    cat("Displaying plots on screen\n")
+    create_plots()
+  }
+}
+
+# =============================================================================
+#                   SAVE TEXT SUMMARY OF ANALYSIS
+# =============================================================================
+save_statistical_results <- function() {
+  sink("Maturation_Analysis_Results.txt")
+  
+  cat("=== MATURATION ANALYSIS USING KING (1995) FORMULATION ===\n\n")
+  cat("MODEL: p' = 1 / (1 + exp[-r(Ct - Ct50)])\n\n")
+  
+  cat("PARAMETER ESTIMATES WITH 95% CONFIDENCE INTERVALS:\n\n")
+  
+  # -------------------- MALES ------------------------
+  cat("MALES:\n")
+  cat("  Ct50 = ", round(king_males$Ct50, 2), " cm\n", sep = "")
+  cat("  95% CI: [", round(king_males$Ct50_CI[1], 2), ", ", 
+      round(king_males$Ct50_CI[2], 2), "] cm\n", sep = "")
+  cat("  r = ", round(king_males$r, 4), "\n", sep = "")
+  cat("  95% CI: [", round(king_males$r_CI[1], 4), ", ", 
+      round(king_males$r_CI[2], 4), "]\n", sep = "")
+  cat("  n = ", king_males$n, "\n\n", sep = "")
+  
+  # -------------------- FEMALES ----------------------
+  cat("FEMALES:\n")
+  cat("  Ct50 = ", round(king_females$Ct50, 2), " cm\n", sep = "")
+  cat("  95% CI: [", round(king_females$Ct50_CI[1], 2), ", ", 
+      round(king_females$Ct50_CI[2], 2), "] cm\n", sep = "")
+  cat("  r = ", round(king_females$r, 4), "\n", sep = "")
+  cat("  95% CI: [", round(king_females$r_CI[1], 4), ", ", 
+      round(king_females$r_CI[2], 4), "]\n", sep = "")
+  cat("  n = ", king_females$n, "\n\n", sep = "")
+  
+  # ---------------- SEXUAL DIMORPHISM ----------------
+  cat("SEXUAL DIMORPHISM IN MATURATION:\n")
+  delta_Ct50 <- king_females$Ct50 - king_males$Ct50
+  cat("  ΔCt50 = ", round(delta_Ct50, 2), " cm\n", sep = "")
+  cat("  Females mature at ", round(100 * (king_females$Ct50/king_males$Ct50 - 1), 1), 
+      "% larger size than males\n", sep = "")
+  
+  ci_overlap <- (king_males$Ct50_CI[1] <= king_females$Ct50_CI[2]) && 
+                (king_females$Ct50_CI[1] <= king_males$Ct50_CI[2])
+  cat("  Ct50 confidence intervals overlap: ", ifelse(ci_overlap, "YES", "NO"), "\n")
+  
+  sink()
+  cat("Statistical results saved to: Maturation_Analysis_Results.txt\n")
+}
+
+# =============================================================================
+#                               RUN ANALYSIS
+# =============================================================================
+
+cat("Starting maturation analysis...\n")
+
+# Save plots (TIFF + PDF)
+create_maturation_plots(save_format = "both", width_cm = 20, height_cm = 16, dpi = 300)
+
+# Save statistical output
+save_statistical_results()
+
+cat("\n=== ANALYSIS COMPLETE ===\n")
+cat("Files created:\n")
+cat("1. Maturation_Analysis_King1995.tiff – High-resolution TIFF\n")
+cat("2. Maturation_Analysis_King1995.pdf  – Vector PDF\n")
+cat("3. Maturation_Analysis_Results.txt   – Text summary\n")
+
+# End L50
+# =============================================================================
